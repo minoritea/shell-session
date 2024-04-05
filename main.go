@@ -15,61 +15,54 @@ import (
 )
 
 func main() {
+	err := run()
+	if err != nil && err != context.Canceled {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
 
 	sock := filepath.Join(home, ".cache", "shell-session.sock")
 
 	err = os.Remove(sock)
 	if err != nil && !os.IsNotExist(err) {
-		log.Panic(err)
+		return err
 	}
 
 	l, err := net.Listen("unix", sock)
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
 	defer os.Remove(sock)
+	defer l.Close()
 
 	cmd := exec.Command("bash")
 	fd, err := pty.Start(cmd)
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
 
-	loop(fd, l)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	go func() { cancel(cmd.Wait()) }()
+	go func() { cancel(loop(ctx, fd, l)) }()
+	<-ctx.Done()
+	return ctx.Err()
 }
 
-func loop(tty *os.File, listener net.Listener) {
-	var (
-		conn   net.Conn
-		ctx    context.Context
-		cancel context.CancelCauseFunc
-		buf    buffer
-	)
+func loop(ctx context.Context, tty *os.File, listener net.Listener) error {
+	var buf buffer
 	go io.Copy(&buf, tty)
 
 	for {
-		newconn, err := listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Panic(err)
+			return err
 		}
-
-		if cancel != nil {
-			cancel(context.Canceled)
-		}
-
-		if ctx != nil {
-			<-ctx.Done()
-			err := ctx.Err()
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
-				log.Panic(err)
-			}
-		}
-		conn = newconn
-		ctx, cancel = context.WithCancelCause(context.Background())
 		go startSession(ctx, &buf, tty, conn)
 	}
 }
@@ -83,8 +76,8 @@ func startSession(ctx context.Context, buf *buffer, tty *os.File, conn net.Conn)
 }
 
 func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) error {
+	var buf [1024]byte
 	for {
-		var buf [1024]byte
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -92,6 +85,9 @@ func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) error {
 			n, err := src.Read(buf[:])
 			if err != nil {
 				return err
+			}
+			if n == 0 {
+				continue
 			}
 			_, err = dst.Write(buf[:n])
 			if err != nil {
